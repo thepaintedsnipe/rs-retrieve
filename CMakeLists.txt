@@ -27,7 +27,9 @@ include_directories(
 )
 
 
-add_executable(rs-retrieve rs-retrieve.cpp)
+set(SOURCES rs-decoder.cpp rs-retrieve.cpp)
+add_executable(rs-retrieve ${SOURCES})
+
 target_link_libraries(rs-retrieve ${DEPENDENCIES} ${FFMPEG_LIBRARIES})
 set_target_properties (rs-retrieve PROPERTIES
 	FOLDER "Examples/OpenCV"
