@@ -106,9 +106,12 @@ int video_param_fps;
 FILE* pFile;
 AVCodec *vcodec = 0;
 AVCodecContext *pCodecCtx;
+AVPacket packet;
+
+
 AVFrame* frame;
 AVFrame* decframe;
-AVPacket packet;
+
 
 static void read_video_parameters()
 {
@@ -126,7 +129,7 @@ static void read_video_parameters()
 *
 * @return 0 on success, error code on failure
 */
-static int initialize_decoder(char *infile, int *width, int *height, int *fps)
+static int initialize_decoder(char *infile, int *width, int *height, int *fps, AVPixelFormat *pix_fmt)
 {
     int ret;
 
@@ -149,6 +152,7 @@ static int initialize_decoder(char *infile, int *width, int *height, int *fps)
     *width = video_param_width;
     *height = video_param_height;
     *fps = video_param_fps;
+    *pix_fmt  = AV_PIX_FMT_YUV420P;
 
     // initialize FFmpeg library
     av_register_all();
@@ -197,6 +201,69 @@ void free_decoder()
     avcodec_close(pCodecCtx);
 }
 
+/**
+/* @brief return a decoded video frame
+/*
+/* @param[in] decodedFrame pointer to AVFrame where decoded video is copied
+/*
+/* returns 0 if a valid frame was decoded
+/*         1 if end of stream
+/*         2 if any other issue
+*/
+int get_decoded_frame(AVFrame* decodedFrame)
+{
+    int got_pic = 0;
+    int retVal = 0;
+    int ret;
+    bool end_of_stream = false;
+
+    do {
+
+        //allocate packet memory
+        if(av_new_packet(&packet,42000)) {
+            retVal = 2;
+            break;
+        }
+
+        if (!end_of_stream) {
+            // read packet from input file
+            ret = read_video_packet(pFile, packet.size, (char *) packet.data);
+            if (ret < 0) {
+                std::cerr << "fail to av_read_frame: ret=" << ret;
+                retVal = 1;
+                end_of_stream = true;
+            }
+            if (ret == 0 ) {
+                std::cout << "PACKET SIZE IS ZERO ";
+                retVal = 1;
+                end_of_stream = true;
+            }
+            packet.size = ret;
+        }
+
+        if (end_of_stream) {
+            std::cerr << "end of stream found so set packet to null" << ret;
+            // null packet for bumping process
+            av_init_packet(&packet);
+            packet.data = nullptr;
+            packet.size = 0;
+        }
+
+        // decode video frame
+        avcodec_decode_video2(pCodecCtx, decframe, &got_pic, &packet);
+
+        // free packet memory
+        av_free_packet(&packet);
+
+        if(got_pic)
+            break;
+
+    } while(end_of_stream);
+
+    return retVal;
+}
+
+
 
 int main(int argc, char * argv[]) try
 {
@@ -215,12 +282,12 @@ int main(int argc, char * argv[]) try
 
     unsigned nb_frames = 0;
     bool end_of_stream = false;
-    int got_pic = 0;
+
 
     int vcodec_width;
     int vcodec_height;
     int vcodec_fps;
-    const AVPixelFormat vcodec_pix_fmt = AV_PIX_FMT_BGR24;
+    AVPixelFormat vcodec_pix_fmt;
 
 
     if (argc < 2) {
@@ -229,14 +296,14 @@ int main(int argc, char * argv[]) try
     }
     infile = argv[1];
 
-    if (initialize_decoder(infile, &vcodec_width, &vcodec_height, &vcodec_fps)) {
+    if (initialize_decoder(infile, &vcodec_width, &vcodec_height, &vcodec_fps, &vcodec_pix_fmt)) {
         return EXIT_FAILURE;
     }
 
     // initialize sample scaler
     SwsContext* swsctx = sws_getCachedContext(
-        nullptr, vcodec_width, vcodec_height, pCodecCtx->pix_fmt,
-        vcodec_width, vcodec_height, vcodec_pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr);
+        nullptr, vcodec_width, vcodec_height, vcodec_pix_fmt,
+        vcodec_width, vcodec_height, AV_PIX_FMT_BGR24, SWS_BICUBIC, nullptr, nullptr, nullptr);
     if (!swsctx) {
         free_decoder();
         return EXIT_FAILURE;
@@ -250,8 +317,8 @@ int main(int argc, char * argv[]) try
         return EXIT_FAILURE;
     }
 
-    std::vector<uint8_t> framebuf(avpicture_get_size(vcodec_pix_fmt, vcodec_width, vcodec_height));
-    avpicture_fill(reinterpret_cast<AVPicture*>(frame), framebuf.data(), vcodec_pix_fmt, vcodec_width, vcodec_height);
+    std::vector<uint8_t> framebuf(avpicture_get_size(AV_PIX_FMT_BGR24, vcodec_width, vcodec_height));
+    avpicture_fill(reinterpret_cast<AVPicture*>(frame), framebuf.data(), AV_PIX_FMT_BGR24, vcodec_width, vcodec_height);
 
 
     // 2. allocate "decframe"
@@ -263,6 +330,56 @@ int main(int argc, char * argv[]) try
     }
 
 
+
+
+
+
+
+#if 1
+    // Decoding Loop
+    do {
+
+        // decode video frame
+        if(get_decoded_frame(decframe)){
+            // either eos or any other error
+            std::cout << "we failed to get decoded frame so quitting" << std::endl;
+            break;
+        }
+
+        // convert frame to OpenCV matrix
+        sws_scale(swsctx, decframe->data, decframe->linesize, 0, decframe->height, frame->data, frame->linesize);
+        {
+            cv::Mat image(vcodec_height, vcodec_width, CV_8UC3, framebuf.data(), frame->linesize[0]);
+
+#ifdef USE_VIDEO_SYNC
+            if(last_frame_display_time) {
+               // assuming that time only increments, never decrements
+               uint64_t time_lapsed = av_gettime() - last_frame_display_time;
+
+               int64_t  delay_required = (1000000/vcodec_fps) - time_lapsed;
+               if(delay_required > 0) {
+                   av_usleep(delay_required);
+               }
+            }
+            last_frame_display_time = av_gettime();
+#endif
+
+            cv::imshow("press ESC to exit", image);
+
+            if (cv::waitKey(1) == 0x1b)
+                break;
+
+        }
+
+        std::cout << nb_frames << '\r' << std::flush;  // dump progress
+        ++nb_frames;
+    } while (!end_of_stream);
+#endif // if 1
+
+
+
+
+#if 0
     // Decoding Loop
     do {
 
@@ -331,6 +448,10 @@ next_packet:
         av_free_packet(&packet);
 
     } while (!end_of_stream || got_pic);
+
+#endif // if 0
+
+
 
 
     std::cout << nb_frames << " frames decoded" << std::endl;
