@@ -19,10 +19,15 @@ extern "C" {
 
 #define USE_VIDEO_SYNC
 
-/*
-// returns 0 if ok, -1 if there was no frame found
-// search_size is the max no of bytes to look for
-// at 10 mbps, 30fps, each frame will be about 42K byes
+
+/**
+* @brief seeks the pFile to next packet boundary
+* @details at 10 mbps, 30fps, each frame will be about 42K byes
+*  search_size could be specified accordingly
+*
+* @param[in] pFile Pointer to the file containing encoded data
+* @param[in] search_size is the max no of bytes to look for
+* @return 0 if ok, -1 if there was no frame found
 */
 static int seek_to_frame(FILE* pFile, int search_size){
 
@@ -49,13 +54,17 @@ static int seek_to_frame(FILE* pFile, int search_size){
     return 0;
 }
 
-/*
-// reads next h264 packet in to buf
-// returns frame size or -1 if error
-// it is assumed that pFile is at frame boundary
-// buf_size is the max size on buf
+/**
+* @brief reads next compressed video packet in to a buffer
+* @details it is assumed that pFile is already at packet boundary
+*  data till next packet is read in to buffer
+*
+* @param[in] pFile Pointer to the file containing encoded data
+* @param[out] buf Pointer to buf where packet data is copied
+* @param[in] buf_size Size of the data buffer
+* @return packet size or -1 if error
 */
-static int  read_next_frame(FILE* pFile, int buf_size, char *buf){
+static int  read_video_packet(FILE* pFile, int buf_size, char *buf){
 
     // save current file pointer
     int start_pos = ftell(pFile);
@@ -87,6 +96,107 @@ static int  read_next_frame(FILE* pFile, int buf_size, char *buf){
     }
 }
 
+// various globals
+
+// video codec parameters
+int video_param_height;
+int video_param_width;
+int video_param_fps;
+
+FILE* pFile;
+AVCodec *vcodec = 0;
+AVCodecContext *pCodecCtx;
+AVFrame* frame;
+AVFrame* decframe;
+AVPacket packet;
+
+static void read_video_parameters()
+{
+    // we need to know width, height & fps
+    // as of now hard-coded values
+    // but these could from a txt file
+    video_param_width = 640;
+    video_param_height = 480;
+    video_param_fps = 30;
+}
+
+
+/**
+* @brief initialize decoder instance
+*
+* @return 0 on success, error code on failure
+*/
+static int initialize_decoder(char *infile, int *width, int *height, int *fps)
+{
+    int ret;
+
+    pFile = fopen (infile, "rb");
+
+    if(pFile == NULL) {
+        std::cout << "Can not open file for writing" << std::endl;
+        return 1;
+    }
+
+    if (seek_to_frame(pFile, 42000) != 0) {
+        std::cout << "Failed to find a valid encoded frame" << std::endl;
+        fclose(pFile);
+        return 1;
+    }
+
+    // read the video parameters
+    read_video_parameters();
+
+    *width = video_param_width;
+    *height = video_param_height;
+    *fps = video_param_fps;
+
+    // initialize FFmpeg library
+    av_register_all();
+    avformat_network_init();
+
+    // Check codec support
+    vcodec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!vcodec)
+    {
+        std::cout << "Unable to find video encoder";
+        return 1;
+    }
+
+    pCodecCtx = avcodec_alloc_context3(vcodec);
+    if (!pCodecCtx)
+    {
+        std::cout << "Unable to allocate encoder context";
+        return 2;
+    }
+
+    pCodecCtx->width = video_param_width;
+    pCodecCtx->height= video_param_height;
+    pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    // open the decoder
+    ret = avcodec_open2(pCodecCtx, vcodec, NULL);
+    if (ret < 0) {
+        std::cerr << "fail to avcodec_open2: ret=" << ret;
+        return 3;
+    }
+
+    //Create packet
+    av_init_packet(&packet);
+
+    return 0;
+}
+
+/**
+* @brief free decoder instance
+*
+* @return none
+*/
+void free_decoder()
+{
+    fclose(pFile);
+    avcodec_close(pCodecCtx);
+}
+
 
 int main(int argc, char * argv[]) try
 {
@@ -100,119 +210,57 @@ int main(int argc, char * argv[]) try
 
     int retVal = EXIT_SUCCESS;
     int ret;
-    const char* infile = argv[1];
-    FILE* pFile = fopen (infile, "rb");
+    char* infile;
 
-    AVCodec *vcodec = 0;
-    AVCodecContext *pCodecCtx;
-    AVFrame* frame;
-    AVFrame* decframe;
-    AVPacket packet;
 
     unsigned nb_frames = 0;
     bool end_of_stream = false;
     int got_pic = 0;
 
-    // we need to know width, height & fps
-    // as of now hard-coded values
-    // but these could from a txt file
-    int video_height = 480;
-    int video_width = 640;
-    int video_fps = 30;
-
-    const int dst_width = video_width;
-    const int dst_height = video_height;
-    const AVPixelFormat dst_pix_fmt = AV_PIX_FMT_BGR24;
+    int vcodec_width;
+    int vcodec_height;
+    int vcodec_fps;
+    const AVPixelFormat vcodec_pix_fmt = AV_PIX_FMT_BGR24;
 
 
     if (argc < 2) {
         std::cout << "Usage: rs-retrieve <infile>" << std::endl;
         return EXIT_FAILURE;
     }
+    infile = argv[1];
 
-    if(pFile == NULL) {
-        std::cout << "Can not open file for writing" << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    if (seek_to_frame(pFile, 42000) != 0) {
-        std::cout << "Failed to find a valid encoded frame" << std::endl;
-        fclose(pFile);
-        return EXIT_FAILURE;
-    }
-
-
-    // initialize FFmpeg library
-    av_register_all();
-
-    avformat_network_init();
-
-
-    // image_encoding = enc::RGB8;
-    // int video_step = video_width*3;
-
-    // Check codec support
-    vcodec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!vcodec)
-    {
-        std::cout << "Unable to find video encoder";
-        fclose(pFile);
-        return EXIT_FAILURE;
-    }
-
-    pCodecCtx = avcodec_alloc_context3(vcodec);
-    if (!pCodecCtx)
-    {
-        std::cout << "Unable to allocate encoder context";
-        fclose(pFile);
-        return EXIT_FAILURE;
-    }
-
-    pCodecCtx->width = video_width;
-    pCodecCtx->height= video_height;
-    pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    // open the decoder
-    ret = avcodec_open2(pCodecCtx, vcodec, NULL);
-    if (ret < 0) {
-        std::cerr << "fail to avcodec_open2: ret=" << ret;
-        fclose(pFile);
+    if (initialize_decoder(infile, &vcodec_width, &vcodec_height, &vcodec_fps)) {
         return EXIT_FAILURE;
     }
 
     // initialize sample scaler
-
     SwsContext* swsctx = sws_getCachedContext(
-        nullptr, pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
-        dst_width, dst_height, dst_pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr);
+        nullptr, vcodec_width, vcodec_height, pCodecCtx->pix_fmt,
+        vcodec_width, vcodec_height, vcodec_pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr);
     if (!swsctx) {
-        avcodec_close(pCodecCtx);
-        fclose(pFile);
+        free_decoder();
         return EXIT_FAILURE;
     }
-    std::cout << "output: " << dst_width << 'x' << dst_height << ',' << av_get_pix_fmt_name(dst_pix_fmt) << std::endl;
+    std::cout << "output: " << vcodec_width << 'x' << vcodec_height << ',' << av_get_pix_fmt_name(vcodec_pix_fmt) << std::endl;
 
-    // allocate frame buffer for output
+    // 1. allocate "frame"
     frame = av_frame_alloc();
     if(frame ==NULL){
-        avcodec_close(pCodecCtx);
-        fclose(pFile);
+        free_decoder();
         return EXIT_FAILURE;
     }
 
-    std::vector<uint8_t> framebuf(avpicture_get_size(dst_pix_fmt, dst_width, dst_height));
-    avpicture_fill(reinterpret_cast<AVPicture*>(frame), framebuf.data(), dst_pix_fmt, dst_width, dst_height);
+    std::vector<uint8_t> framebuf(avpicture_get_size(vcodec_pix_fmt, vcodec_width, vcodec_height));
+    avpicture_fill(reinterpret_cast<AVPicture*>(frame), framebuf.data(), vcodec_pix_fmt, vcodec_width, vcodec_height);
 
+
+    // 2. allocate "decframe"
     decframe = av_frame_alloc();
     if(decframe ==NULL){
-        av_frame_free(&decframe);
-        avcodec_close(pCodecCtx);
-        fclose(pFile);
+        av_frame_free(&frame);
+        free_decoder();
         return EXIT_FAILURE;
     }
-
-    //Create packet
-    av_init_packet(&packet);
 
 
     // Decoding Loop
@@ -225,7 +273,7 @@ int main(int argc, char * argv[]) try
 
         if (!end_of_stream) {
             // read packet from input file
-            ret = read_next_frame(pFile, packet.size, (char *) packet.data);
+            ret = read_video_packet(pFile, packet.size, (char *) packet.data);
             if (ret < 0) {
                 std::cerr << "fail to av_read_frame: ret=" << ret;
                 end_of_stream = true;
@@ -253,21 +301,21 @@ int main(int argc, char * argv[]) try
         // convert frame to OpenCV matrix
         sws_scale(swsctx, decframe->data, decframe->linesize, 0, decframe->height, frame->data, frame->linesize);
         {
-            cv::Mat image(dst_height, dst_width, CV_8UC3, framebuf.data(), frame->linesize[0]);
+            cv::Mat image(vcodec_height, vcodec_width, CV_8UC3, framebuf.data(), frame->linesize[0]);
 
 #ifdef USE_VIDEO_SYNC
             if(last_frame_display_time) {
                // assuming that time only increments, never decrements
                uint64_t time_lapsed = av_gettime() - last_frame_display_time;
 
-               int64_t  delay_required = (1000000/video_fps) - time_lapsed;
+               int64_t  delay_required = (1000000/vcodec_fps) - time_lapsed;
                if(delay_required > 0) {
                    av_usleep(delay_required);
                }
             }
+            last_frame_display_time = av_gettime();
 #endif
 
-            last_frame_display_time = av_gettime();
             cv::imshow("press ESC to exit", image);
 
             if (cv::waitKey(1) == 0x1b)
@@ -284,12 +332,13 @@ next_packet:
 
     } while (!end_of_stream || got_pic);
 
+
     std::cout << nb_frames << " frames decoded" << std::endl;
 
     av_frame_free(&frame);
     av_frame_free(&decframe);
-    avcodec_close(pCodecCtx);
-    fclose(pFile);
+
+    free_decoder();
 
     return retVal;
 }
